@@ -1,0 +1,334 @@
+---
+title: "MCMC Spike and Slab"
+output:
+  html_document:
+    df_print: paged
+  html_notebook: default
+  pdf_document: default
+---
+## data generate
+```{r}
+set.seed(2026)
+
+n <- 50   # Number of samples
+J <- 2    # Number of species
+P <- 2    # Number of covariates
+
+# 1) Generate (t_i, X_i1, X_i2)
+t_vec <- rbinom(n, size=1, prob=0.5)  # 50% of individuals receive treatment, 50% are in the control group
+X_mat <- matrix(rnorm(n*P), n, P)     # Covariate matrix
+
+# 2) True parameters
+sigma_alpha2 <- 1.0    # Prior variance for alpha_j
+sigmaZ_true  <- 2.0    # True noise variance
+
+# Example with J=2:
+#   alpha_j ~ N(0, sqrt(sigma_alpha2))
+alpha_true <- rnorm(J, 0, sqrt(sigma_alpha2))
+
+#   zeta_j -> Indicator for whether phi_j is nonzero
+zeta_true <- c(1, 0)  # First species has a nonzero phi, second species has phi=0
+phi_true  <- c(1.5, 0)  # If zeta_j=1, then phi_j=1.5; otherwise, phi_j=0 (example)
+
+#   eta_{j,p} -> Indicator for whether theta_{j,p} is nonzero
+#   Manually specifying some nonzero values:
+eta_true   <- matrix(c(1,0, 0,1), J, P, byrow=TRUE)
+#   Which means:
+#     For j=1: (eta_{1,1}=1 => theta_{1,1}=-1.0), (eta_{1,2}=0 => theta_{1,2}=0)
+#     For j=2: (eta_{2,1}=0 => theta_{2,1}=0),   (eta_{2,2}=1 => theta_{2,2}=0.8)
+theta_true <- matrix(0, J, P)
+theta_true[1,1] <- -1.0
+theta_true[2,2] <- 0.8
+
+# 3) Generate observations Z_{i,j}
+Z <- matrix(0, n, J)
+for(j in 1:J){
+  # Linear predictor
+  mu_j <- alpha_true[j] + phi_true[j]*t_vec + X_mat %*% theta_true[j, ]
+  # Add noise
+  Z[,j] <- rnorm(n, mean=mu_j, sd=sqrt(sigmaZ_true))
+}
+```
+
+
+### Spike and slab 
+```{r}
+mcmc_spike_slab_microbiome_hier <- function(
+  Z,             # (n x J) data matrix: rows = samples, columns = taxa
+  t_vec,         # length-n vector for treatment indicator
+  X_mat,         # (n x P) covariate matrix
+
+  # Prior hyperparameters:
+  # 1) alpha_j ~ N(0, sigma_alpha2)
+  sigma_alpha2 = 1.0,
+
+  # 2) Spike-and-slab for phi_j:
+  #    phi_j | zeta_j=1 ~ N(0, h_phi * sigmaZ2), else phi_j=0
+  #    zeta_j ~ Bernoulli(pi_j), pi_j ~ Beta(a_zeta[j], b_zeta[j])
+  a_zeta, b_zeta,      # length-J vectors
+  h_phi = 1,
+
+  # 3) Spike-and-slab for theta_{jp}:
+  #    theta_{jp} | eta_{jp}=1 ~ N(0, h_theta * sigmaZ2), else 0
+  #    eta_{jp} ~ Bernoulli(r_{jp}), r_{jp} ~ Beta(a_eta[j,p], b_eta[j,p])
+  a_eta, b_eta,        # (J x P) matrices
+  h_theta = 1,
+
+  # 4) Error variance prior: sigmaZ^2 ~ IG(a0, b0)
+  a0 = 2, b0 = 2,
+
+  # MCMC settings
+  niter = 4000, nburn = 2000, thin = 2,
+  seed = 123
+){
+  set.seed(seed)
+  n <- nrow(Z)
+  J <- ncol(Z)
+  P <- ncol(X_mat)
+
+  #--------------------- 1) Initialize parameters ---------------------#
+  alpha <- rep(0, J)
+
+  phi    <- rep(0, J)
+  zeta   <- rbinom(J, 1, 0.5)   # inclusion indicators for phi_j
+  pi_j   <- rep(0.5, J)         # prior probabilities for zeta_j
+
+  theta  <- matrix(0, J, P)
+  eta    <- matrix(rbinom(J*P, 1, 0.5), J, P)  # inclusion indicators for theta_{jp}
+  r_jp   <- matrix(0.5, J, P)                 # prior probabilities for eta_{jp}
+
+  sigmaZ2 <- 1.0
+
+  #--------------------- 2) Prepare storage for posterior samples ---------------------#
+  nsave <- (niter - nburn) / thin
+
+  alpha_save <- matrix(0, nsave, J)
+  phi_save   <- matrix(0, nsave, J)
+  zeta_save  <- matrix(0, nsave, J)
+  pi_j_save  <- matrix(0, nsave, J)
+
+  theta_save <- array(0, c(nsave, J, P))
+  eta_save   <- array(0, c(nsave, J, P))
+  r_jp_save  <- array(0, c(nsave, J, P))
+
+  sigmaZ2_save <- numeric(nsave)
+
+  #--------------------- 3) Main MCMC loop ---------------------#
+  isave <- 1
+  for(iter in 1:niter){
+
+    # (A) Update alpha_j
+    #    alpha_j has a conjugate normal prior: alpha_j ~ N(0, sigma_alpha2).
+    #    Posterior is also normal given the linear model and data.
+    for(jj in 1:J){
+      # Compute partial residual: Z - phi_j * t - X_mat * theta_j
+      resid_j <- Z[, jj] - (phi[jj] * t_vec + X_mat %*% theta[jj, ])
+
+      # Posterior variance and mean for alpha_j
+      var_alpha_j  <- 1 / ( n / sigmaZ2 + 1 / sigma_alpha2 )
+      mean_alpha_j <- var_alpha_j * ( sum(resid_j) / sigmaZ2 )
+
+      # Sample alpha_j from posterior normal
+      alpha[jj] <- rnorm(1, mean_alpha_j, sqrt(var_alpha_j))
+    }
+
+    # (B) Update pi_j, zeta_j, phi_j
+    #     pi_j is a Beta prior for inclusion probability; zeta_j is Bernoulli(pi_j).
+    #     phi_j has spike-and-slab: either 0 or N(0, h_phi*sigmaZ2).
+    for(jj in 1:J){
+
+      # (B1) Update pi_j (fully hierarchical)
+      a_post_j <- a_zeta[jj] + zeta[jj]
+      b_post_j <- b_zeta[jj] + (1 - zeta[jj])
+      pi_j[jj] <- rbeta(1, a_post_j, b_post_j)
+
+      # (B2) Compare zeta_j = 0 vs. 1 to compute log-likelihood ratio
+      phi_old <- phi[jj]
+
+      # Case zeta_j = 0 => phi_j = 0 => compute rss_0
+      phi[jj] <- 0
+      rss_0 <- sum( (Z[, jj] - alpha[jj] - X_mat %*% theta[jj, ])^2 )
+
+      # Case zeta_j = 1 => phi_j ~ N(0, h_phi*sigmaZ2)
+      # Conjugate update for phi_j
+      # Temporarily set phi=0 to compute partial residual
+      phi[jj] <- 0
+      resid_j <- Z[, jj] - alpha[jj] - X_mat %*% theta[jj, ]
+      # Restore old phi (only for consistency, won't be used further)
+      phi[jj] <- phi_old
+
+      var_post  <- 1 / ( sum(t_vec^2) / sigmaZ2 + 1 / (h_phi * sigmaZ2) )
+      mean_post <- var_post * ( sum(t_vec * resid_j) / sigmaZ2 )
+
+      # Use mean_post as a trial phi_star to compute rss_1
+      phi_star <- mean_post
+      mu_1    <- alpha[jj] + phi_star * t_vec + X_mat %*% theta[jj, ]
+      rss_1   <- sum( (Z[, jj] - mu_1)^2 )
+
+      # Log-likelihood ratio + log-prior ratio
+      log_lik_ratio   <- -0.5 * (rss_1 - rss_0) / sigmaZ2
+      log_prior_ratio <- log( pi_j[jj] / (1 - pi_j[jj]) )
+      logit_val       <- log_lik_ratio + log_prior_ratio
+      p_incl          <- 1 / (1 + exp(-logit_val))
+
+      new_zeta <- rbinom(1, 1, p_incl)
+      zeta[jj] <- new_zeta
+      if(new_zeta == 1){
+        # If zeta_j=1, sample phi_j from normal posterior
+        phi[jj] <- rnorm(1, mean_post, sqrt(var_post))
+      } else {
+        # If zeta_j=0, set phi_j = 0
+        phi[jj] <- 0
+      }
+    }
+
+    # (C) Update r_{jp}, eta_{jp}, theta_{jp}
+    #     r_{jp} is a Beta prior for inclusion probability; eta_{jp} is Bernoulli(r_{jp}).
+    #     theta_{jp} has spike-and-slab: either 0 or N(0, h_theta*sigmaZ2).
+    for(jj in 1:J){
+      for(pp in 1:P){
+
+        # (C1) Update r_{jp}
+        a_post_jp <- a_eta[jj, pp] + eta[jj, pp]
+        b_post_jp <- b_eta[jj, pp] + (1 - eta[jj, pp])
+        r_jp[jj, pp] <- rbeta(1, a_post_jp, b_post_jp)
+
+        # (C2) Compare eta_{jp} = 0 vs. 1 => compute rss_0, rss_1
+        theta_old <- theta[jj, pp]
+
+        # Case eta_{jp} = 0 => theta_{jp} = 0
+        theta[jj, pp] <- 0
+        mu_0  <- alpha[jj] + phi[jj] * t_vec + X_mat %*% theta[jj, ]
+        rss_0 <- sum( (Z[, jj] - mu_0)^2 )
+
+        # Case eta_{jp} = 1 => theta_{jp} ~ N(0, h_theta*sigmaZ2)
+        theta[jj, pp] <- theta_old
+        # Temporarily set theta_{jp}=0 to get partial residual
+        theta[jj, pp] <- 0
+        resid_jp <- Z[, jj] - alpha[jj] - phi[jj]*t_vec - X_mat %*% theta[jj, ]
+        theta[jj, pp] <- theta_old
+
+        x_p <- X_mat[, pp]
+        var_post  <- 1 / ( sum(x_p^2) / sigmaZ2 + 1 / (h_theta * sigmaZ2) )
+        mean_post <- var_post * sum(x_p * resid_jp) / sigmaZ2
+
+        # Compute rss_1 using a trial theta_star = mean_post
+        theta_star <- mean_post
+        mu_1 <- alpha[jj] + phi[jj]*t_vec + X_mat %*% theta[jj, ] + theta_star * x_p
+        rss_1 <- sum( (Z[, jj] - mu_1)^2 )
+
+        # Log-likelihood ratio + log-prior ratio for eta_{jp}
+        log_lik_ratio   <- -0.5 * (rss_1 - rss_0) / sigmaZ2
+        log_prior_ratio <- log( r_jp[jj, pp] / (1 - r_jp[jj, pp]) )
+        logit_val       <- log_lik_ratio + log_prior_ratio
+        p_incl          <- 1 / (1 + exp(-logit_val))
+
+        new_eta <- rbinom(1, 1, p_incl)
+        eta[jj, pp] <- new_eta
+
+        if(new_eta == 1){
+          # Sample theta_{jp} if it is included
+          theta[jj, pp] <- rnorm(1, mean_post, sqrt(var_post))
+        } else {
+          # Otherwise, set it to 0
+          theta[jj, pp] <- 0
+        }
+      }
+    }
+
+    # (D) Update sigmaZ^2
+    #     sigmaZ^2 ~ Inverse-Gamma(a0, b0). Conjugate update by computing residual sums.
+    resid2 <- 0
+    for(jj in 1:J){
+      mu_j <- alpha[jj] + phi[jj]*t_vec + X_mat %*% theta[jj, ]
+      resid2 <- resid2 + sum( (Z[, jj] - mu_j)^2 )
+    }
+    shape_post <- a0 + n*J/2
+    rate_post  <- b0 + resid2/2
+    sigmaZ2 <- 1 / rgamma(1, shape = shape_post, rate = rate_post)
+
+    # (E) Save posterior samples after burn-in and thinning
+    if(iter > nburn && (iter - nburn) %% thin == 0){
+      alpha_save[isave, ]   <- alpha
+      phi_save[isave, ]     <- phi
+      zeta_save[isave, ]    <- zeta
+      pi_j_save[isave, ]    <- pi_j
+
+      theta_save[isave, , ] <- theta
+      eta_save[isave, , ]   <- eta
+      r_jp_save[isave, , ]  <- r_jp
+
+      sigmaZ2_save[isave]   <- sigmaZ2
+      isave <- isave + 1
+    }
+  } # end of MCMC loop
+
+  # Return MCMC results
+  list(
+    alpha   = alpha_save,   
+    phi     = phi_save,     
+    zeta    = zeta_save,  
+    pi_j    = pi_j_save,   
+
+    theta   = theta_save,   
+    eta     = eta_save,     
+    r_jp    = r_jp_save,    
+
+    sigmaZ2 = sigmaZ2_save  
+  )
+}
+
+```
+
+
+## results
+```{r}
+res <- mcmc_spike_slab_microbiome_hier(
+  Z = Z, t_vec = t_vec, X_mat = X_mat,
+  sigma_alpha2 = 1.0,
+  a_zeta = rep(1, ncol(Z)), 
+  b_zeta = rep(1, ncol(Z)), 
+  h_phi = 1,
+  a_eta = matrix(1, nrow=ncol(Z), ncol=ncol(X_mat)),
+  b_eta = matrix(1, nrow=ncol(Z), ncol=ncol(X_mat)),
+  h_theta = 1,
+  a0=2, b0=2,
+  niter=3000, nburn=1000, thin=2
+)
+
+# Compute posterior means
+alpha_postmean <- apply(res$alpha, 2, mean)   # Size J
+phi_postmean   <- apply(res$phi,   2, mean)   # Size J
+zeta_inclusion <- apply(res$zeta,  2, mean)   # Size J
+mean_sigmaZ2   <- mean(res$sigmaZ2)           # Note: direct mean()
+
+theta_postmean <- apply(res$theta, c(2,3), mean) # (J x P)
+eta_inclusion  <- apply(res$eta,   c(2,3), mean) # (J x P)
+
+print("Posterior Mean:")
+print("Posterior mean of alpha:")
+print(apply(res$alpha, 2, mean))
+
+print("Posterior mean of phi:")
+print(apply(res$phi, 2, mean))
+
+print("Posterior probability of zeta inclusion:")
+print(apply(res$zeta, 2, mean))  # A value between 0 and 1, the closer to 1, the higher the probability of inclusion
+
+print("Posterior mean of sigmaZ^2:")
+print(mean(res$sigmaZ2))
+
+print("Posterior mean of theta:")
+print(apply(res$theta, c(2,3), mean))  # Dimension J×P
+
+print("Posterior probability of eta inclusion:")
+print(apply(res$eta, c(2,3), mean))  # Dimension J×P
+
+print("Posterior mean of pi_j (prior probability of zeta):")
+print(apply(res$pi_j, 2, mean))  # Dimension J
+
+print("Posterior mean of r_jp (prior probability of eta):")
+print(apply(res$r_jp, c(2,3), mean))  # Dimension J×P
+
+```
+
