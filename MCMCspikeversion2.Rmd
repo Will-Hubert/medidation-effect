@@ -1,0 +1,501 @@
+---
+title: "MCMC Spike and Slab"
+output:
+  html_document:
+    df_print: paged
+  html_notebook: default
+  pdf_document: default
+---
+## data generate
+
+
+```{r}
+simulate_spike_slab_data_fixed <- function(
+  n             = 100,     # Sample size
+  J             = 100,     # Number of taxa (features)
+  P             = 6,       # Number of covariates
+  seed          = 123,     # Random seed
+  sigma_alpha2  = 1.0,     # Variance for baseline alpha_j
+  tau_phi       = 1.0,     # Slab variance multiplier for treatment effect phi_j
+  tau_theta     = 1.0,     # Slab variance multiplier for covariate effect theta_jp
+  sigma2_global = 1.0      # Residual noise variance
+) {
+  set.seed(seed)
+
+  # 1) True treatment inclusion indicators (zeta_true)
+  zeta_true <- rep(0, J)
+  zeta_true[1:14] <- 1  # First 14 taxa are affected by treatment
+
+  # 2) True covariate inclusion indicators (eta_true)
+  if (P < 4) {
+    stop("P must be >= 4 to set first 2 and last 2 covariates.")
+  }
+  eta_true <- matrix(0, nrow = J, ncol = P)
+  for (j in seq_len(J)) {
+    eta_true[j, 1]   <- 1
+    eta_true[j, 2]   <- 1
+    eta_true[j, P-1] <- 1
+    eta_true[j, P]   <- 1
+  }
+
+  # 3) True baseline inclusion indicators (gamma_true)
+  gamma_true <- rep(0, J)
+  gamma_true[1:20] <- 1  # First 20 taxa have non-zero baseline alpha_j
+
+  # 4) Generate baseline effects (alpha_true)
+  alpha_true <- rep(0, J)
+  alpha_true[gamma_true == 1] <- rnorm(
+    sum(gamma_true == 1),
+    mean = 0,
+    sd = sqrt(sigma_alpha2)
+  )
+
+  # 5) Generate treatment assignment vector
+  t_vec <- rbinom(n, size = 1, prob = 0.5)
+
+  # 6) Generate covariate matrix
+  X_mat <- matrix(rnorm(n * P), nrow = n, ncol = P)
+
+  # 7) Generate treatment effects (phi_true)
+  phi_true <- rep(0, J)
+  phi_true[zeta_true == 1] <- rnorm(
+    sum(zeta_true == 1),
+    mean = 0,
+    sd = sqrt(tau_phi * sigma2_global)
+  )
+
+  # 8) Generate covariate effects (theta_true)
+  theta_true <- matrix(0, nrow = J, ncol = P)
+  for (j in seq_len(J)) {
+    for (p in seq_len(P)) {
+      if (eta_true[j, p] == 1) {
+        theta_true[j, p] <- rnorm(
+          1,
+          mean = 0,
+          sd = sqrt(tau_theta * sigma2_global)
+        )
+      }
+    }
+  }
+
+  # 9) Generate observed data matrix (M)
+  M <- matrix(0, nrow = n, ncol = J)
+  for (j in seq_len(J)) {
+    mu_j <- alpha_true[j] + phi_true[j] * t_vec + X_mat %*% theta_true[j, ]
+    e_ij <- rnorm(n, mean = 0, sd = sqrt(sigma2_global))
+    M[, j] <- mu_j + e_ij
+  }
+
+  # 10) Return as a list
+  return(list(
+    M           = M,
+    t_vec       = t_vec,
+    X_mat       = X_mat,
+    alpha_true  = alpha_true,
+    phi_true    = phi_true,
+    theta_true  = theta_true,
+    gamma_true  = gamma_true,
+    zeta_true   = zeta_true,
+    eta_true    = eta_true
+  ))
+}
+
+```
+
+
+### Spike and slab 
+```{r}
+mcmc_spike_slab_microbiome <- function(
+  M, t_vec, X_mat,
+  sigma_alpha2 = 1,         # alpha_j ~ Normal(0, sigma_alpha2)
+  a0 = 1, b0 = 1,           # sigma_M2 ~ InverseGamma(a0, b0)
+  a_zeta = 1, b_zeta = 1,   # Beta hyperparameters for global inclusion prob of treatment (theta_zeta)
+  tau_phi = 1,              # slab variance multiplier for treatment effect phi
+  a_eta = 1, b_eta = 1,     # Beta hyperparameters for covariate inclusion probs (r_jp)
+  tau_theta = 1,            # slab variance multiplier for covariate effect theta
+  niter = 3000, nburn = 1000, thin = 2,
+  k_pi_update = 10,         # update theta_zeta every k_pi_update iterations
+  k_rjp_update = 10,        # update r_jp every k_rjp_update iterations
+  seed = 123
+) {
+  set.seed(seed)
+  
+  # Dimensions
+  n <- nrow(M)  # number of samples
+  J <- ncol(M)  # number of taxa
+  P <- ncol(X_mat)  # number of covariates
+  
+  # Initialize parameters
+  alpha     <- rep(0, J)
+  phi       <- rep(0, J)
+  zeta      <- rbinom(J, 1, 0.5)  # initial treatment inclusion
+  theta_zeta <- 0.5               # global inclusion for treatment
+  theta     <- matrix(0, J, P)
+  eta       <- matrix(rbinom(J * P, 1, 0.5), J, P)  # initial covariate inclusion
+  r_jp      <- matrix(0.5, J, P)  # inclusion probability for each taxon-covariate
+  sigma_M2  <- rep(1, J)          # residual variance per taxon
+  
+  # Prepare for MCMC saving
+  nsave <- (niter - nburn) / thin
+  alpha_save       <- matrix(0, nsave, J)
+  phi_save         <- matrix(0, nsave, J)
+  zeta_save        <- matrix(0, nsave, J)
+  theta_save       <- array(0, c(nsave, J, P))
+  eta_save         <- array(0, c(nsave, J, P))
+  r_jp_save        <- array(0, c(nsave, J, P))
+  sigma_M2_save    <- matrix(0, nsave, J)
+  theta_zeta_save  <- numeric(nsave)
+  
+  # Function to compute log marginal likelihood (for treatment inclusion update)
+  compute_log_marginal_lik <- function(y, X, sigma2, tau_vec) {
+    XtX <- crossprod(X)
+    Xty <- crossprod(X, y)
+    tau_inv_diag <- diag(1 / tau_vec)
+    V <- XtX + tau_inv_diag
+    V_inv <- solve(V)
+    quad_term <- sum(y^2) - t(Xty) %*% V_inv %*% Xty
+    log_det <- determinant(V, logarithm = TRUE)$modulus
+    n_obs <- length(y)
+    log_ml <- -0.5 * (
+      n_obs * log(2 * pi * sigma2) + log_det + quad_term / sigma2
+    )
+    return(as.numeric(log_ml))
+  }
+  
+  # MCMC Loop
+  for (iter in seq_len(niter)) {
+    # 1) Update alpha_j
+    for (jj in seq_len(J)) {
+      resid_j <- M[, jj] - (phi[jj] * t_vec + X_mat %*% theta[jj, ])
+      var_alpha_j <- 1 / ((n / sigma_M2[jj]) + (1 / sigma_alpha2))
+      mean_alpha_j <- var_alpha_j * sum(resid_j) / sigma_M2[jj]
+      alpha[jj] <- rnorm(1, mean_alpha_j, sqrt(var_alpha_j))
+    }
+    
+    # 2) Update global treatment inclusion probability (theta_zeta)
+    if (iter %% k_pi_update == 0) {
+      theta_zeta <- rbeta(1, a_zeta + sum(zeta), b_zeta + (J - sum(zeta)))
+    }
+    
+    # 3) Update zeta_j (treatment inclusion) and phi_j
+    for (jj in seq_len(J)) {
+      # Log-marginal-likelihood difference for zeta=1 vs zeta=0
+      X1 <- cbind(1, t_vec, X_mat)
+      tau1 <- c(sigma_alpha2, tau_phi * sigma_M2[jj], rep(tau_theta * sigma_M2[jj], P))
+      X0 <- cbind(1, X_mat)
+      tau0 <- c(sigma_alpha2, rep(tau_theta * sigma_M2[jj], P))
+      
+      log_ml1 <- compute_log_marginal_lik(M[, jj], X1, sigma_M2[jj], tau1)
+      log_ml0 <- compute_log_marginal_lik(M[, jj], X0, sigma_M2[jj], tau0)
+      
+      logodds <- log_ml1 - log_ml0 + log(theta_zeta) - log(1 - theta_zeta)
+      # Constrain log-odds for numerical stability
+      logodds <- max(min(logodds, 15), -15)
+      p_incl <- 1 / (1 + exp(-logodds))
+      zeta[jj] <- rbinom(1, 1, p_incl)
+      
+      # If zeta_j = 1, sample phi_j from its posterior; otherwise set to 0
+      if (zeta[jj] == 1) {
+        resid_j <- M[, jj] - alpha[jj] - X_mat %*% theta[jj, ]
+        var_phi_j <- 1 / (sum(t_vec^2) / sigma_M2[jj] + 1 / (tau_phi * sigma_M2[jj]))
+        mean_phi_j <- var_phi_j * sum(t_vec * resid_j) / sigma_M2[jj]
+        phi[jj] <- rnorm(1, mean_phi_j, sqrt(var_phi_j))
+      } else {
+        phi[jj] <- 0
+      }
+    }
+    
+    # 4) Update eta_jp (covariate inclusion) and theta_jp
+    for (jj in seq_len(J)) {
+      for (pp in seq_len(P)) {
+        # Temporarily set theta_jp = 0 to compute RSS0
+        theta[jj, pp] <- 0
+        mu0 <- alpha[jj] + phi[jj] * t_vec + X_mat %*% theta[jj, ]
+        rss0 <- sum((M[, jj] - mu0)^2)
+        
+        # Compute candidate theta_star (proposed value if included)
+        x_p <- X_mat[, pp]
+        theta_exclude <- matrix(theta[jj, -pp], ncol = 1)
+        resid_jp <- M[, jj] - alpha[jj] - phi[jj] * t_vec -
+          X_mat[, -pp, drop = FALSE] %*% theta_exclude
+        
+        var_theta_jp <- 1 / (sum(x_p^2) / sigma_M2[jj] + 1 / (tau_theta * sigma_M2[jj]))
+        mean_theta_jp <- var_theta_jp * sum(x_p * resid_jp) / sigma_M2[jj]
+        theta_star <- rnorm(1, mean_theta_jp, sqrt(var_theta_jp))
+        
+        # Compute RSS1 if theta_jp = theta_star
+        mu1 <- mu0 + theta_star * x_p
+        rss1 <- sum((M[, jj] - mu1)^2)
+        log_lik_ratio <- -0.5 * (rss1 - rss0) / sigma_M2[jj]
+        
+        # Slab prior contribution vs spike
+        log_slab <- -0.5 * (theta_star^2 / (tau_theta * sigma_M2[jj])) -
+          0.5 * log(2 * pi * tau_theta * sigma_M2[jj])
+        log_spike <- 0
+        
+        # Combine with the local inclusion probability r_jp
+        log_on <- log(r_jp[jj, pp]) + log_slab
+        log_off <- log(1 - r_jp[jj, pp]) + log_spike
+        log_prior_ratio <- log_on - log_off
+        
+        # Decide inclusion vs exclusion
+        log_alpha_jp <- log_lik_ratio + log_prior_ratio
+        p_incl <- 1 / (1 + exp(-log_alpha_jp))
+        eta[jj, pp] <- rbinom(1, 1, p_incl)
+        
+        # Assign final theta_jp
+        theta[jj, pp] <- if (eta[jj, pp] == 1) theta_star else 0
+      }
+    }
+    
+    # 5) Update r_jp (local covariate inclusion probability)
+    if (iter %% k_rjp_update == 0) {
+      for (jj in seq_len(J)) {
+        for (pp in seq_len(P)) {
+          r_jp[jj, pp] <- rbeta(1, a_eta + eta[jj, pp], b_eta + (1 - eta[jj, pp]))
+        }
+      }
+    }
+    
+    # 6) Update sigma_M2 (residual variance for each taxon)
+    for (jj in seq_len(J)) {
+      mu_j <- alpha[jj] + phi[jj] * t_vec + X_mat %*% theta[jj, ]
+      rss_j <- sum((M[, jj] - mu_j)^2)
+      sigma_M2[jj] <- 1 / rgamma(1, a0 + n / 2, b0 + rss_j / 2)
+    }
+    
+    # 7) Save posterior samples after burn-in and thinning
+    if (iter > nburn && (iter - nburn) %% thin == 0) {
+      idx <- (iter - nburn) / thin
+      alpha_save[idx, ]      <- alpha
+      phi_save[idx, ]        <- phi
+      zeta_save[idx, ]       <- zeta
+      theta_save[idx, , ]    <- theta
+      eta_save[idx, , ]      <- eta
+      r_jp_save[idx, , ]     <- r_jp
+      sigma_M2_save[idx, ]   <- sigma_M2
+      theta_zeta_save[idx]   <- theta_zeta
+    }
+  }
+  
+  # Return MCMC output
+  list(
+    alpha       = alpha_save,
+    phi         = phi_save,
+    zeta        = zeta_save,
+    theta       = theta_save,
+    eta         = eta_save,
+    r_jp        = r_jp_save,
+    sigma_M2    = sigma_M2_save,
+    theta_zeta  = theta_zeta_save
+  )
+}
+
+```
+
+```{r}
+evaluate_selection <- function(true, inclusion, threshold = 0.5) {
+  # Determine which entries are selected (above threshold)
+  selected <- inclusion > threshold
+  
+  # Calculate confusion matrix components
+  TP <- sum(selected & (true == 1))
+  FP <- sum(selected & (true == 0))
+  FN <- sum((!selected) & (true == 1))
+  
+  # Precision, Recall, and F1
+  precision <- ifelse(TP + FP == 0, NA, TP / (TP + FP))
+  recall    <- ifelse(TP + FN == 0, NA, TP / (TP + FN))
+  f1_score  <- ifelse(
+    is.na(precision) | is.na(recall) | (precision + recall) == 0,
+    NA,
+    2 * precision * recall / (precision + recall)
+  )
+  
+  # Return as a small data frame
+  data.frame(
+    TP        = TP,
+    FP        = FP,
+    FN        = FN,
+    Precision = round(precision, 3),
+    Recall    = round(recall, 3),
+    F1        = round(f1_score, 3)
+  )
+}
+
+```
+
+## results
+```{r}
+# 1) Generate synthetic data
+sim_data <- simulate_spike_slab_data_fixed(
+  n             = 100,
+  J             = 100,
+  P             = 6,
+  seed          = 2023,
+  sigma_alpha2  = 1.0,
+  tau_phi       = 2.0,
+  tau_theta     = 2.0,
+  sigma2_global = 1.0
+)
+
+M         <- sim_data$M
+t_vec     <- sim_data$t_vec
+X_mat     <- sim_data$X_mat
+zeta_true <- sim_data$zeta_true
+eta_true  <- sim_data$eta_true
+
+# 2) Run MCMC
+res <- mcmc_spike_slab_microbiome(
+  M         = M,
+  t_vec     = t_vec,
+  X_mat     = X_mat,
+  a_zeta    = 1,
+  b_zeta    = 1,
+  a_eta     = 1,
+  b_eta     = 1,
+  tau_phi   = 1,
+  tau_theta = 2,
+  niter     = 10000,
+  nburn     = 3000,
+  thin      = 2
+)
+
+# 3) Posterior means and inclusion probabilities
+alpha_postmean   <- apply(res$alpha, 2, mean)
+phi_postmean     <- apply(res$phi,   2, mean)
+zeta_inclusion   <- apply(res$zeta,  2, mean)
+theta_postmean   <- apply(res$theta, c(2, 3), mean)
+eta_inclusion    <- apply(res$eta,   c(2, 3), mean)
+sigmaM2_postmean <- mean(res$sigma_M2)
+
+cat("Posterior mean of sigma_M^2:", round(sigmaM2_postmean, 4), "\n\n")
+
+cat("Top 10 posterior inclusion probabilities for treatment effects (zeta):\n")
+print(round(zeta_inclusion[1:10], 3))
+
+cat("\nTop 5 rows of posterior inclusion probabilities for covariate effects (eta):\n")
+print(round(eta_inclusion[1:5, ], 3))
+
+# 4) Selection based on threshold
+threshold <- 0.5
+
+cat("\nSelected Treatment Effects (zeta = 1):\n")
+cat("Inclusion threshold =", threshold, "\n")
+selected_treatment <- which(zeta_inclusion > threshold)
+if (length(selected_treatment) == 0) {
+  cat("No treatment effects exceed the threshold.\n")
+} else {
+  cat("Selected taxa indices:", selected_treatment, "\n")
+}
+
+cat("\nSelected Covariate Effects (eta = 1):\n")
+cat("Inclusion threshold =", threshold, "\n")
+selected_covariates <- which(eta_inclusion > threshold, arr.ind = TRUE)
+if (nrow(selected_covariates) == 0) {
+  cat("No covariate-taxon pairs exceed the threshold.\n")
+} else {
+  for (k in 1:nrow(selected_covariates)) {
+    j_idx <- selected_covariates[k, 1]
+    p_idx <- selected_covariates[k, 2]
+    cat(sprintf(
+      "Taxon %3d – Covariate %d: Inclusion = %.3f | Theta = %.3f\n",
+      j_idx, p_idx, eta_inclusion[j_idx, p_idx], theta_postmean[j_idx, p_idx]
+    ))
+  }
+}
+
+# 5) Compare posterior inclusion to ground truth
+cat("\nGround Truth vs. Posterior Inclusion (All Taxa):\n")
+for (j in seq_along(zeta_true)) {
+  cat(sprintf(
+    "Taxon %3d: zeta_true = %d | zeta_inclusion = %.3f\n",
+    j, zeta_true[j], zeta_inclusion[j]
+  ))
+}
+
+# 6) Accuracy for treatment and covariate inclusion
+zeta_eval <- evaluate_selection(
+  true      = zeta_true,
+  inclusion = zeta_inclusion,
+  threshold = threshold
+)
+eta_eval  <- evaluate_selection(
+  true      = as.vector(eta_true),
+  inclusion = as.vector(eta_inclusion),
+  threshold = threshold
+)
+
+zeta_df <- data.frame(
+  Metric = c("True Positives", "False Positives", "False Negatives", "Precision", "Recall", "F1 Score"),
+  Value  = round(unlist(zeta_eval), 3)
+)
+eta_df <- data.frame(
+  Metric = c("True Positives", "False Positives", "False Negatives", "Precision", "Recall", "F1 Score"),
+  Value  = round(unlist(eta_eval), 3)
+)
+
+# Calculate overall accuracy
+total_zeta  <- length(zeta_true)
+TN_zeta     <- total_zeta - zeta_eval$TP - zeta_eval$FP - zeta_eval$FN
+accuracy_zeta <- (zeta_eval$TP + TN_zeta) / total_zeta
+
+total_eta   <- length(as.vector(eta_true))
+TN_eta      <- total_eta - eta_eval$TP - eta_eval$FP - eta_eval$FN
+accuracy_eta <- (eta_eval$TP + TN_eta) / total_eta
+
+cat("\nAccuracy for Treatment Inclusion (zeta)\n")
+print(zeta_df, row.names = FALSE)
+cat(sprintf("Overall Accuracy: %.3f\n", round(accuracy_zeta, 3)))
+
+cat("\nAccuracy for Covariate Inclusion (eta)\n")
+print(eta_df, row.names = FALSE)
+cat(sprintf("Overall Accuracy: %.3f\n", round(accuracy_eta, 3)))
+
+# 7) Detailed comparison of selected vs. true indices
+cat("\nTreatment Inclusion Index Check:\n")
+true_treatment     <- which(zeta_true == 1)
+selected_treatment <- which(zeta_inclusion > threshold)
+false_positives    <- setdiff(selected_treatment, true_treatment)
+false_negatives    <- setdiff(true_treatment, selected_treatment)
+true_positives     <- intersect(selected_treatment, true_treatment)
+
+cat("True zeta=1 taxa indices:\n", true_treatment, "\n")
+cat("Selected taxa indices:\n", selected_treatment, "\n")
+cat("True Positives:\n", true_positives, "\n")
+cat("False Positives (selected but not true):\n", false_positives, "\n")
+cat("False Negatives (true but not selected):\n", false_negatives, "\n")
+
+# Evaluate how F1, Recall, and Precision vary with threshold
+thresholds <- seq(0.1, 0.9, by = 0.05)
+f1s       <- numeric(length(thresholds))
+recalls   <- numeric(length(thresholds))
+precisions <- numeric(length(thresholds))
+
+for (i in seq_along(thresholds)) {
+  th <- thresholds[i]
+  eval_i <- evaluate_selection(zeta_true, zeta_inclusion, th)
+  f1s[i]       <- eval_i$F1
+  recalls[i]   <- eval_i$Recall
+  precisions[i] <- eval_i$Precision
+}
+
+plot(
+  thresholds, f1s,
+  type = "l", col = "blue", lwd = 2,
+  ylab = "Score", xlab = "Threshold", ylim = c(0,1)
+)
+lines(thresholds, recalls, col = "red", lwd = 2, lty = 2)
+lines(thresholds, precisions, col = "green", lwd = 2, lty = 3)
+legend(
+  "bottomleft",
+  legend = c("F1", "Recall", "Precision"),
+  col    = c("blue", "red", "green"),
+  lty    = 1:3,
+  lwd    = 2
+)
+
+```
+
+
+
