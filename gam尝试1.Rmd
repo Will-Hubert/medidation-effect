@@ -1,0 +1,337 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Cmd+Shift+Enter*. 
+
+```{r}
+
+simulate_log_abundance_data <- function(
+  n = 100,         # 样本数
+  J = 50,          # 微生物种类数（taxa）
+  P = 5,           # 协变量个数
+  a0 = 2, b0 = 2,  # InvGamma 超参数 for σ²_M
+  sigma_alpha2 = 1.0,
+  sigma_j2 = 1.0,
+  aj = 1, bj = 4,      # Beta 超参数 for φ_j inclusion
+  ajp = 1, bjp = 9,    # Beta 超参数 for θ_jp inclusion
+  seed = 123
+) {
+  set.seed(seed)
+
+  # 1. Generate covariates & treatment
+  T <- rbinom(n, 1, 0.5)                  # binary treatment
+  X <- matrix(rnorm(n * P), nrow = n)     # continuous covariates
+
+  # 2. Sample inclusion probabilities
+  pi_phi   <- rbeta(J, aj, bj)                # φ_j inclusion probs
+  pi_theta <- matrix(rbeta(J * P, ajp, bjp), J, P)  # θ_jp inclusion probs
+
+  # 3. Sample inclusion indicators
+  zeta <- rbinom(J, 1, pi_phi)            # φ_j included?
+  eta  <- matrix(rbinom(J * P, 1, as.vector(pi_theta)), J, P)
+
+  # 4. Sample parameters
+  alpha <- rnorm(J, 0, sqrt(sigma_alpha2))           # α_j intercept
+  phi   <- rnorm(J, 0, sqrt(sigma_j2)) * zeta        # φ_j treatment effect
+  theta <- matrix(rnorm(J * P, 0, sqrt(sigma_j2)), J, P) * eta  # θ_jp covariate effects
+
+  # 5. Sample residual variance
+  sigma2_M <- 1 / rgamma(1, shape = a0, rate = b0)
+
+  # 6. Generate M_ij log abundance
+  M <- matrix(NA, n, J)
+  for (i in 1:n) {
+    for (j in 1:J) {
+      mu_ij <- alpha[j] + phi[j] * T[i] + sum(theta[j, ] * X[i, ])
+      M[i, j] <- rnorm(1, mean = mu_ij, sd = sqrt(sigma2_M))
+    }
+  }
+
+  # Return everything
+  list(
+    M = M, T = T, X = X,
+    alpha = alpha, phi = phi, theta = theta,
+    zeta = zeta, eta = eta,
+    sigma2_M = sigma2_M,
+    pi_phi = pi_phi, pi_theta = pi_theta
+  )
+}
+
+# 调用示例
+sim_data <- simulate_log_abundance_data()
+str(sim_data$M)  # 查看模拟的 log-abundance 数据矩阵
+
+```
+
+```{r}
+library(spikeSlabGAM)
+options(mc.cores = 4)
+# 模拟数据
+J <- ncol(sim_data$M)
+M <- sim_data$M
+T <- sim_data$T
+X <- sim_data$X
+
+# 构造元数据（treatment + covariates）
+df_meta <- data.frame(Treatment = T, X)
+
+# 初始化结果列表
+results_list <- vector("list", J)
+
+for (j in seq_len(J)) {
+  # 当前 response
+  y_j <- M[, j]
+  df_model_j <- data.frame(y = y_j, df_meta)
+
+  # 构造带 lin() 的公式字符串
+  form_j <- as.formula(
+    paste("y ~", paste0("lin(", colnames(df_meta), ")", collapse = " + "))
+  )
+
+  # 使用 tryCatch 进行健壮建模
+  fit_j <- tryCatch({
+    spikeSlabGAM(
+      formula = form_j,
+      data    = df_model_j,
+      family  = "gaussian",
+      mcmc    = list(nChains = 2, chainLength = 6000, burnin = 2000, thin = 4),
+      hyperparameters = list(
+        gamma = c(v0 = 2.5e-4),
+        w     = c(a = 1, b = 1),
+        tau2  = c(a = 5, b = 25)
+      )
+    )
+  }, error = function(e) {
+    message("❌ Error at taxon ", j, ": ", conditionMessage(e))
+    return(NULL)
+  })
+
+  results_list[[j]] <- fit_j
+}
+
+```
+
+```{r batch_spikeSlabGAM_analysis_fixed, fig.width=6, fig.height=4, warning=FALSE, message=FALSE}
+
+library(spikeSlabGAM)
+library(ggplot2)
+
+# 假设 results_list 已经包含所有 J 个模型
+J <- length(results_list)
+K <- min(10, J)  # 只跑前 10 个
+
+for (j in seq_len(K)) {
+  fit_j <- results_list[[j]]
+  if (is.null(fit_j)) {
+    cat("⚠️ Taxon", j, "模型为 NULL，跳过\n\n")
+    next
+  }
+  
+  cat("============ Taxon", j, "============\n")
+  
+  # 1) summary()
+  cat("1) summary():\n")
+  print(summary(fit_j, threshold = 0.5))
+  
+  # 2) postInclusionProb
+  cat("\n2) postInclusionProb:\n")
+  print(fit_j$postInclusionProb)
+  
+  # 3) plot()
+  cat("\n3) plot():\n")
+  plot(fit_j)
+  
+  # 4) plotTerm("lin(Treatment)")
+  cat("\n4) plotTerm(\"lin(Treatment)\"):\n")
+  plotTerm("lin(Treatment)", fit_j)
+  
+  # 5) predict(type="response")
+  cat("\n5) predict(type = 'response') 前 6 个：\n")
+  yhat <- predict(fit_j, type = "response")
+  print(head(yhat, 6))
+  
+  # 6) getPosteriorTerm("lin(Treatment)")
+  cat("\n6) getPosteriorTerm(\"lin(Treatment)\") -> 样本维度：\n")
+  post_linT <- tryCatch({
+    getPosteriorTerm(
+      "lin(Treatment)",
+      model      = fit_j,
+      returnData = FALSE
+    )
+  }, error = function(e) {
+    message("Error at getPosteriorTerm for Taxon ", j, ": ", e$message)
+    return(NULL)
+  })
+  if (!is.null(post_linT)) {
+    cat("  dim =", paste(dim(post_linT), collapse = " x "), "\n")
+  }
+  
+  cat("\n\n")
+}
+
+```
+
+```{r eval_performance_using_get_phi, warning=FALSE, message=FALSE}
+# ————————————————
+# 1. Setup
+# ————————————————
+library(spikeSlabGAM)
+library(ggplot2)
+if (requireNamespace("caret", quietly=TRUE)) library(caret)
+options(mc.cores = 4)   # 并行核数
+
+# ————————————————
+# 2. 模拟数据函数
+# ————————————————
+simulate_log_abundance_data <- function(
+  n = 100, J = 50, P = 5,
+  a0 = 2, b0 = 2,
+  sigma_alpha2 = 1, sigma_j2 = 1,
+  aj = 1, bj = 4, ajp = 1, bjp = 9,
+  seed = 123
+) {
+  set.seed(seed)
+  T <- rbinom(n, 1, 0.5)
+  X <- matrix(rnorm(n * P), nrow = n)
+  pi_phi   <- rbeta(J, aj, bj)
+  pi_theta <- matrix(rbeta(J * P, ajp, bjp), J, P)
+  zeta <- rbinom(J, 1, pi_phi)
+  eta  <- matrix(rbinom(J * P, 1, as.vector(pi_theta)), J, P)
+  alpha <- rnorm(J, 0, sqrt(sigma_alpha2))
+  phi   <- rnorm(J, 0, sqrt(sigma_j2)) * zeta
+  theta <- matrix(rnorm(J * P, 0, sqrt(sigma_j2)), J, P) * eta
+  sigma2_M <- 1 / rgamma(1, shape = a0, rate = b0)
+  M <- matrix(NA, n, J)
+  for (i in 1:n) for (j in 1:J) {
+    mu_ij <- alpha[j] + phi[j] * T[i] + sum(theta[j, ] * X[i, ])
+    M[i, j] <- rnorm(1, mu_ij, sqrt(sigma2_M))
+  }
+  list(
+    M = M, T = T, X = X,
+    alpha = alpha, phi = phi, theta = theta,
+    zeta = zeta, eta = eta,
+    sigma2_M = sigma2_M,
+    pi_phi = pi_phi, pi_theta = pi_theta
+  )
+}
+
+# ————————————————
+# 3. 生成模拟数据
+# ————————————————
+sim_data <- simulate_log_abundance_data()
+M <- sim_data$M; T <- sim_data$T; X <- sim_data$X
+df_meta <- data.frame(Treatment = T, X)
+J <- ncol(M)
+
+# ————————————————
+# 4. 逐 taxon 拟合 spikeSlabGAM
+# ————————————————
+results_list <- vector("list", J)
+for (j in seq_len(J)) {
+  y_j <- M[, j]
+  df_model_j <- data.frame(y = y_j, df_meta)
+  form_j <- as.formula(paste("y ~", paste0("lin(", colnames(df_meta), ")", collapse = " + ")))
+  results_list[[j]] <- tryCatch(
+    spikeSlabGAM(
+      formula = form_j,
+      data    = df_model_j,
+      family  = "gaussian",
+      mcmc    = list(nChains = 2, chainLength = 6000, burnin = 2000, thin = 4),
+      hyperparameters = list(
+        gamma = c(v0 = 2.5e-4),
+        w     = c(a = 1, b = 1),
+        tau2  = c(a = 5, b = 25)
+      )
+    ),
+    error = function(e) {
+      message("Error at taxon ", j, ": ", e$message)
+      NULL
+    }
+  )
+}
+```
+
+
+```{r eval_performance_using_get_phi, warning=FALSE, message=FALSE}
+# ————————————————
+# 5. 辅助函数：提取 φ_hat 与 φ_pip
+# ————————————————
+get_phi_hat <- function(fit) {
+  if (is.null(fit)) return(NA_real_)
+  summ <- tryCatch(summary(fit), error = function(e) return(NULL))
+  # summary 对象里，回归系数保存在 postMeans$beta
+  if (is.null(summ) || is.null(summ$postMeans$beta)) return(NA_real_)
+  coef_pm <- summ$postMeans$beta
+  # 精确匹配 lin(Treatment) 这一项
+  idx <- grep("^lin\\(Treatment\\)$", names(coef_pm), value = TRUE)
+  if (length(idx) == 0) return(NA_real_)
+  as.numeric(coef_pm[idx])
+}
+
+
+get_phi_pip <- function(fit) {
+  if (is.null(fit)) return(NA_real_)
+  summ <- tryCatch(summary(fit), error = function(e) return(NULL))
+  if (is.null(summ)) return(NA_real_)
+  ts <- summ$trmSummary
+  if (is.null(ts) || !"lin(Treatment)" %in% rownames(ts)) return(NA_real_)
+  ts["lin(Treatment)", "P(gamma = 1)"]
+}
+
+# ————————————————
+# 6. 提取真值与估计值
+# ————————————————
+phi_true  <- unlist(sim_data$phi)
+zeta_true <- as.integer(unlist(sim_data$zeta))
+phi_hat   <- sapply(results_list, get_phi_hat)
+phi_pip   <- sapply(results_list, get_phi_pip)
+
+# ————————————————
+# 7. 连续评估：MSE
+# ————————————————
+mse_all    <- mean((phi_hat - phi_true)^2, na.rm = TRUE)
+signal_idx <- which(zeta_true == 1)
+mse_signal <- if (length(signal_idx))
+  mean((phi_hat[signal_idx] - phi_true[signal_idx])^2, na.rm = TRUE) else NA_real_
+cat("===== 连续估计误差 (φ) =====\n")
+cat("Overall MSE     :", round(mse_all,    4), "\n")
+cat("Signal-only MSE :", round(mse_signal, 4), "\n\n")
+
+# ————————————————
+# 8. 离散分类评估：混淆矩阵 & 指标
+# ————————————————
+threshold <- 0.5
+predicted <- as.integer(phi_pip > threshold)
+predicted[is.na(predicted)] <- 0
+cm_table <- table(
+  Predicted = factor(predicted, c(0,1)),
+  True      = factor(zeta_true, c(0,1))
+)
+cat("===== 离散分类评估 (ζ) =====\n")
+print(cm_table)
+accuracy  <- sum(diag(cm_table))/sum(cm_table)
+precision <- if ((cm_table["1","1"]+cm_table["1","0"])>0)
+               cm_table["1","1"]/sum(cm_table["1",]) else NA
+recall    <- if ((cm_table["1","1"]+cm_table["0","1"])>0)
+               cm_table["1","1"]/sum(cm_table[,"1"]) else NA
+F1        <- if (!is.na(precision)&&!is.na(recall)&&(precision+recall)>0)
+               2*precision*recall/(precision+recall) else NA
+cat(sprintf("Accuracy: %.3f   Precision: %.3f   Recall: %.3f   F1: %.3f\n",
+            accuracy, precision, recall, F1))
+
+# （可选）caret::confusionMatrix 详细报告
+if (requireNamespace("caret", quietly=TRUE)) {
+  cm <- confusionMatrix(
+    factor(predicted, c(0,1)),
+    factor(zeta_true, c(0,1)),
+    positive = "1"
+  )
+  print(cm)
+}
+
+```
+

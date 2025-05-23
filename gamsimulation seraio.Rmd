@@ -1,0 +1,343 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+
+
+
+
+```{r}
+
+simulate_spike_slab_data <- function(
+  n=100, J=100, P=6,
+  a0=2,  b0=2,         # InvGamma 误差先验
+  a_z=1, b_z=4,        # Beta 超先验 for ζ
+  a_e=1, b_e=9,        # Beta 超先验 for η
+  a_tau=5, b_tau=25,   # slab 方差 InvGamma
+  sigma_alpha2 = 1,
+  seed = NULL 
+){
+
+if (!is.null(seed)) set.seed(seed)
+  ## 1. 抽误差方差
+  sigma2_M <- 1 / rgamma(1, a0, b0)
+
+  ## 2. 抽 baseline
+  alpha_true <- rnorm(J, 0, sqrt(sigma_alpha2))
+
+  ## 3. 抽 ζ 并生成 φ
+  p_zeta <- rbeta(1, a_z, b_z)
+  zeta_true <- rbinom(J, 1, p_zeta)
+  sigma2_phi <- 1 / rgamma(J, a_tau, b_tau)        # taxon-specific slab
+  phi_true <- rnorm(J, 0, sqrt(sigma2_phi)) * zeta_true  # spike-and-slab
+
+  ## 4. 抽 η 并生成 θ
+  p_eta <- rbeta(1, a_e, b_e)
+  eta_true <- matrix(rbinom(J*P, 1, p_eta), J, P)
+  sigma2_theta <- 1 / rgamma(J, a_tau, b_tau)
+  theta_true <- matrix(rnorm(J*P, 0, rep(sqrt(sigma2_theta), each=P)), J, P) * eta_true
+
+  ## 5. 生成 T 与 X
+  t_vec <- rbinom(n, 1, 0.5)
+  X_mat <- matrix(rnorm(n*P), n, P)
+
+  ## 6. 生成 M
+  M <- sapply(1:J, function(j){
+    mu <- alpha_true[j] + phi_true[j]*t_vec + X_mat %*% theta_true[j,]
+    rnorm(n, mu, sqrt(sigma2_M))
+  })
+
+  list(M=M, t_vec=t_vec, X_mat=X_mat,
+       alpha_true=alpha_true, phi_true=phi_true, theta_true=theta_true,
+       zeta_true=zeta_true, eta_true=eta_true, sigma2_M=sigma2_M)
+}
+
+
+```
+
+
+```{r}
+simulate_custom_spike_slab <- function(
+ n,                  # Number of samples
+  J,                  # Number of taxa
+  P,                  # Number of covariates
+  zeta_index,         # Indices of taxa with nonzero φ_j (treatment effect)
+  eta_index,          # List: taxon j → covariate indices with nonzero θ_jp
+  phi_val,            # Value assigned to nonzero φ_j
+  theta_val,          # Value assigned to nonzero θ_jp
+  sigma2_M,           # Residual variance
+  sigma_alpha2,       # Variance of α_j
+  seed                # Random seed
+) {
+  if (!is.null(seed)) set.seed(seed)
+  # --- 1. Simulate treatment vector and covariate matrix ---
+  t_vec <- rbinom(n, 1, 0.5)                 # Binary treatment: Bernoulli(0.5)
+  X_mat <- matrix(rnorm(n * P), n, P)        # Covariates: i.i.d. N(0,1)
+  # --- 2. Initialize φ_j and zeta_j (treatment effect indicators) ---
+  zeta_true <- rep(0, J)                     # Binary indicators: 1 if taxon j is affected by treatment
+  phi_true  <- rep(0, J)                     # Treatment effect values
+  zeta_true[zeta_index] <- 1
+  phi_true[zeta_index] <- phi_val
+  # --- 3. Initialize θ_jp and eta_jp (covariate effect indicators) ---
+  eta_true   <- matrix(0, J, P)              # Binary indicator: 1 if taxon j affected by covariate p
+  theta_true <- matrix(0, J, P)              # Covariate effect matrix
+  for (j in seq_len(J)) {
+    if (as.character(j) %in% names(eta_index)) {
+      p_idx <- eta_index[[as.character(j)]]
+      eta_true[j, p_idx] <- 1
+      theta_true[j, p_idx] <- theta_val
+    }
+  }
+  # --- 4. Simulate baseline α_j ---
+  alpha_true <- rnorm(J, 0, sqrt(sigma_alpha2))  # Taxon-specific intercepts
+  # --- 5. Simulate M_{ij} ---
+  # Each taxon j is modeled as: M_ij = α_j + φ_j * t_i + ∑_p θ_jp * X_ip + ε_ij
+  M <- sapply(1:J, function(j) {
+    mu <- alpha_true[j] + phi_true[j] * t_vec + X_mat %*% theta_true[j, ]
+    rnorm(n, mean = mu, sd = sqrt(sigma2_M))
+  })
+  # --- 6. Return all components ---
+  list(
+    M = M,                         # Microbial abundance matrix (n × J)
+    t_vec = t_vec,                 # Treatment vector (length n)
+    X_mat = X_mat,                 # Covariate matrix (n × P)
+    alpha_true = alpha_true,      # Baseline intercepts per taxon
+    phi_true   = phi_true,        # True φ_j values
+    zeta_true  = zeta_true,       # Indicators for nonzero φ_j
+    theta_true = theta_true,      # True θ_jp values
+    eta_true   = eta_true,        # Indicators for nonzero θ_jp
+    sigma2_M   = sigma2_M         # Noise variance
+  )
+}
+```
+
+```{r}
+library(foreach)
+library(doParallel)
+```
+
+
+```{r}
+library(spikeSlabGAM)
+options(mc.cores = 4)   # 并行核数
+
+# ---- 1. simulation data ----
+sim_data <- simulate_custom_spike_slab(
+  n = 50,                     # Small sample size
+  J = 60,                    # Number of microbial taxa
+  P = 100,                   # Extremely high-dimensional covariates (RNA-seq-like)
+
+  # Treatment effects: only 5 taxa
+  zeta_index = c(10, 20, 30, 40, 50),
+
+  # Covariate effects: 3 sparse signals in the noise
+  eta_index = list(
+    `5` = c(10, 20, 30),
+    `15` = c(40, 50),
+    `50` = c(80, 90)
+  ),
+
+  phi_val = 1.5,              # Strong treatment signal
+  theta_val = 1.0,            # Moderate covariate signal
+
+  sigma2_M = 1.0,
+  sigma_alpha2 = 1.0,
+  seed = 2025
+)
+
+
+
+M     <- sim_data$M
+T_vec <- sim_data$t_vec
+X_mat <- sim_data$X_mat
+
+# ---- true value ----
+phi_true  <- sim_data$phi_true
+zeta_true <- sim_data$zeta_true
+
+# ---- 2. Construct metadata and model matrix ----
+df_meta <- data.frame(T = T_vec, X_mat)
+colnames(df_meta) <- c("T", paste0("X", seq_len(ncol(X_mat))))
+
+# ---- 3. Standardize covariates (excluding treatment) ----
+# Scale all columns except the treatment variable "T"
+df_meta_scaled <- as.data.frame(scale(df_meta[, -1]))  # Assume "T" is not standardized
+df_meta_scaled$T <- df_meta$T  # Add the unscaled "T" column back
+
+# ---- 4. Fit spike-and-slab models for each taxon ----
+results_list <- list()
+
+for (j in seq_len(ncol(M))) {
+  y_j <- M[, j]  # Response vector for taxon j
+
+  # Combine standardized covariates and outcome
+  df_model_j <- data.frame(y = y_j, df_meta_scaled)
+
+  # Build formula with spikeSlabGAM's "lin()" wrapper for linear terms
+  form_j <- as.formula(paste("y ~", paste0("lin(", colnames(df_meta_scaled), ")", collapse = " + ")))
+
+  # Fit model using spikeSlabGAM, with error handling for robustness
+  fit_j <- tryCatch({
+    spikeSlabGAM(
+      formula = form_j,
+      data    = df_model_j,
+      family  = "gaussian",
+      mcmc    = list(nChains = 4, chainLength = 7000, burnin = 3000, thin = 5),
+      hyperparameters = list(
+        gamma = c(v0 = 1e-2),   # Sharper spike for better sparsity
+        w     = c(a = 1, b = 1),  # Uniform prior on variable inclusion
+        tau2  = c(a = 2, b = 2)  # Prior for slab variance
+      )
+    )
+  }, error = function(e) {
+    message("Error at taxon ", j, ": ", conditionMessage(e))
+    return(NULL)
+  })
+
+  results_list[[j]] <- fit_j
+}
+
+
+```
+
+
+
+```{r}
+# ==== φ_hat/pip ====
+get_phi_hat <- function(fit) {
+  if (is.null(fit)) return(NA_real_)
+  summ <- tryCatch(summary(fit), error = function(e) return(NULL))
+  if (is.null(summ)) return(NA_real_)
+  alpha_pm <- summ$postMeans$alpha # posterior means of regression coefficients for each variable
+  idx <- grep("^alpha\\.lin\\(T\\)$", names(alpha_pm))
+  if (length(idx) == 0) return(NA_real_)
+  return(as.numeric(alpha_pm[idx]))
+}
+get_phi_pip <- function(fit) {
+  if (is.null(fit)) return(NA_real_)
+  summ <- tryCatch(summary(fit), error = function(e) return(NULL))
+  if (is.null(summ)) return(NA_real_)
+  ts <- summ$trmSummary 
+  if (!is.null(ts) && "lin(T)" %in% rownames(ts) && "P(gamma = 1)" %in% colnames(ts)) {
+    return(as.numeric(ts["lin(T)", "P(gamma = 1)"]))
+  } else {
+    return(NA_real_)
+  }
+}
+phi_hat <- sapply(results_list, get_phi_hat)
+phi_pip <- sapply(results_list, get_phi_pip)
+# ====  θ_hat/ pip====
+get_theta_results <- function(fit, p_names) {
+  if (is.null(fit)) return(list(pip = rep(NA_real_, length(p_names)), coef = rep(NA_real_, length(p_names))))
+  summ <- tryCatch(summary(fit), error = function(e) return(NULL))
+  if (is.null(summ)) return(list(pip = rep(NA_real_, length(p_names)), coef = rep(NA_real_, length(p_names))))
+  alpha_pm <- summ$postMeans$alpha
+  coef <- sapply(p_names, function(pn) {
+    idx <- grep(paste0("^alpha\\.lin\\(", pn, "\\)$"), names(alpha_pm))
+    if (length(idx) == 0) return(NA_real_)
+    as.numeric(alpha_pm[idx])
+  })
+  ts <- summ$trmSummary
+  pip <- sapply(p_names, function(pn) {
+    rn <- paste0("lin(", pn, ")")
+    if (!is.null(ts) && rn %in% rownames(ts) && "P(gamma = 1)" %in% colnames(ts)) {
+      return(as.numeric(ts[rn, "P(gamma = 1)"]))
+    } else {
+      return(NA_real_)
+    }
+  })
+  list(pip = pip, coef = coef)
+}
+# ====  θ  ====
+p_names <- paste0("X", 1:ncol(X_mat))
+theta_eval <- purrr::map_dfr(
+  .x = seq_along(results_list),
+  .f = function(j) {
+    res <- get_theta_results(results_list[[j]], p_names)
+    tibble(
+      Taxon       = paste0("Taxon_", j),
+      Covariate   = p_names,
+      theta_hat   = res$coef,
+      pip         = res$pip,
+      theta_true  = as.vector(sim_data$theta_true[j, ]),
+      eta_true    = as.vector(sim_data$eta_true[j, ])
+    )
+  }
+)
+# ==== φ  ====
+phi_eval <- tibble(
+  Taxon         = paste0("Taxon_", seq_along(phi_hat)),
+  Variable      = "T",
+  True_included = sim_data$zeta_true,
+  Coef_hat      = phi_hat,
+  Coef_true     = sim_data$phi_true,
+  PIP           = phi_pip
+)
+# ==== θ 结果表 ====
+theta_eval_merged <- theta_eval %>%
+  rename(
+    Variable      = Covariate,
+    Coef_hat      = theta_hat,
+    Coef_true     = theta_true,
+    True_included = eta_true,
+    PIP           = pip
+  ) %>%
+  select(Taxon, Variable, True_included, Coef_true, Coef_hat, PIP)
+# ==== φ + θ ====
+variable_eval <- bind_rows(phi_eval, theta_eval_merged)
+```
+
+
+```{r}
+# ==== MSE Evaluation ====
+
+# Count number of non-missing coefficient estimates
+n_valid <- sum(!is.na(variable_eval$Coef_hat) & !is.na(variable_eval$Coef_true))
+cat("Number of valid estimates:", n_valid, "\n")
+
+# Overall Mean Squared Error (all variables)
+mse_all <- mean((variable_eval$Coef_hat - variable_eval$Coef_true)^2, na.rm = TRUE)
+
+# MSE for true signals only (i.e., where True_included == 1)
+mse_signal <- variable_eval %>%
+  filter(True_included == 1) %>%
+  summarise(mse = mean((Coef_hat - Coef_true)^2, na.rm = TRUE)) %>%
+  pull(mse)
+
+cat("== Continuous Estimation Error ==\n")
+cat("Overall MSE       :", round(mse_all, 4), "\n")
+cat("Signal-only MSE   :", round(mse_signal, 4), "\n")
+
+# ==== Binary Variable Selection Accuracy (based on PIP > 0.5) ====
+
+# Predict whether each variable is included based on posterior inclusion probability (PIP)
+variable_eval <- variable_eval %>%
+  mutate(predicted = as.integer(PIP > 0.5)) %>%
+  mutate(predicted = ifelse(is.na(predicted), 0L, predicted))  # Treat NA as not selected
+
+# Compute confusion matrix (requires 'caret' package)
+if (requireNamespace("caret", quietly = TRUE)) {
+  library(caret)
+  cm <- confusionMatrix(
+    factor(variable_eval$predicted, levels = c(0, 1)),
+    factor(variable_eval$True_included, levels = c(0, 1)),
+    positive = "1"
+  )
+  print(cm)
+} else {
+  cat("Package 'caret' not installed. Skipping confusion matrix evaluation.\n")
+}
+
+```
+
+
+
+
+
+
+
+
+
+
+
